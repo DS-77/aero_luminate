@@ -177,15 +177,6 @@ def main():
         
     # Single image case    
     if mode == "single":
-        
-        # All metrics
-        cd = 0
-        sri_1 = 0
-        sri_2 = 0
-        mse = 0
-        gmsd = 0
-        ssim = 0
-        psnr = 0
 
         # Read the images
         shadow_img = cv.imread(input_shadow)
@@ -195,6 +186,7 @@ def main():
         shadow_img_bin = convert_to_binary(shadow_img)
         no_shadow_img_bin = convert_to_binary(no_shadow_img)
 
+        # All metrics
         cd = CD(shadow_img, no_shadow_img)
         sri_1, sri_2 = compute_SRI(shadow_img, no_shadow_img)
         mse = MSE(shadow_img_bin, no_shadow_img_bin)
@@ -215,7 +207,16 @@ def main():
 
     # Batch of images
     elif mode == "directory":
-        # TODO: Add code to evaluate a batch of images (directory)
+        # Evaluation file
+        eval_doc_path = f"{output_dir}/{date.today()}.csv"
+
+        # Gathering images
+        shadow_imgs = os.listdir(input_shadow)
+        no_shadow_imgs = os.listdir(input_no_shadow)
+
+        shadow_imgs.sort()
+        no_shadow_imgs.sort()
+
         # All Metrics
         cd = []
         sri = []
@@ -224,7 +225,63 @@ def main():
         ssim = []
         psnr = []
 
-        pass
+        # Adding columns to results files
+        results_df = pd.DataFrame(columns=["Image_Name", "CD", "SRI", "MSE", "GMSD", "SSIM", "PSNR"])
+
+        for i in tqdm.tqdm(range(len(shadow_imgs))):
+            # Get the shadow and no shadow images
+            s_img_path = f"{input_shadow}/{shadow_imgs[i]}"
+            ns_img_path = f"{input_no_shadow}/{no_shadow_imgs[i]}"
+
+            s_img = cv.imread(s_img_path)
+            ns_img = cv.imread(ns_img_path)
+
+            # Binary version
+            s_img_bin = convert_to_binary(s_img)
+            ns_img_bin = convert_to_binary(ns_img)
+
+            # Compute the metrics
+            temp_cd = CD(s_img, ns_img)
+            temp_gmsd = GMSD(s_img, ns_img)
+            temp_psnr = PSNR(s_img_bin, ns_img_bin)
+            temp_ssim = ssim_fn(s_img_bin, ns_img_bin)
+            temp_mse = MSE(s_img_bin, ns_img_bin)
+            temp_sri_1, temp_sri_2  = compute_SRI(s_img, ns_img)
+
+            # Add the metrics to respective list
+            cd.append(temp_cd)
+            sri.append((temp_sri_2 - temp_sri_1))
+            mse.append(temp_mse)
+            gmsd.append(temp_gmsd)
+            ssim.append(temp_ssim)
+            psnr.append(temp_psnr)
+
+            # Add metric for current image to the result data frame
+            results_df = results_df._append({
+                "Image_Name" : shadow_imgs[i],
+                "CD" : f"{temp_cd:.5f}",
+                "SRI" : f"{(temp_sri_2 - temp_sri_1):.5f}",
+                "MSE" : f"{temp_mse:.5f}",
+                "GMSD" : f"{temp_gmsd:.5f}",
+                "SSIM" : f"{temp_ssim:.5f}",
+                "PSNR" : f"{temp_psnr:.5f}"
+            }, ignore_index=True)
+
+        # Print the averages to the screen
+        print(f"Directory Evaluation: {input_shadow}")
+        print("-" * 80)
+        print(f"Average CD: {np.mean(cd):.5f}")
+        print(f"Average SRI: {np.mean(sri):.5f}")
+        print(f"Average MSE: {np.mean(mse):.5f}")
+        print(f"Average GMSD: {np.mean(gmsd):.5f}")
+        print(f"Average SSIM: {np.mean(ssim):.5f}")
+        print(f"Average PSNR: {np.mean(psnr):.5f}")
+        print("-" * 80)
+
+        # Save results to csv file
+        results_df.to_csv(eval_doc_path)
+        print(f"Output file saved.: {eval_doc_path}")
+
     else:
         print(f"ERROR: {mode} is unrecognised.")
 
