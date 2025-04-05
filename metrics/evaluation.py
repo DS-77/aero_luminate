@@ -1,12 +1,14 @@
 """
-This module evaluates the testing image(s) for the Aero_Illuminate project using the following metrics: Shadow Recovery Index (SRI), Colour Dissimilarity (CD),
-and Gradient Magnitude Similarity Derivation (GMSD). This evaluation script is based on the implementation described by Mingqiang Guo et al. "Shadow removal method for high-resolution aerial remote sensing images
-based on region group matching"
+This module evaluates the testing image(s) for the Aero_Illuminate project using the following metrics: Shadow Recovery
+Index (SRI), Colour Dissimilarity (CD), and Gradient Magnitude Similarity Derivation (GMSD). This evaluation script is
+based on the implementation described by Mingqiang Guo et al. "Shadow removal method for high-resolution aerial remote
+sensing images based on region group matching". We also included standard inpainting metrics: Structural Similarity
+Index Measure (SSIM), Signal-to-Noise Ratio (PSNR), Mean Square Error (MSE) and Root Mean Square Error(RMSE).
 
 Author: Deja S.
 Created: 27-03-2025
-Edited: 27-03-2025
-Version: 1.0.0
+Edited: 04-04-2025
+Version: 1.0.2
 """
 
 import os
@@ -16,6 +18,33 @@ import cv2 as cv
 import numpy as np
 import pandas as pd
 from datetime import date
+from math import log10, sqrt
+from skimage.metrics import structural_similarity as ssim_fn
+
+
+def convert_to_binary(image, threshold=127):
+    gray_image = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+
+    _, binary_image = cv.threshold(gray_image, threshold, 255, cv.THRESH_BINARY)
+    return binary_image
+
+def MSE(shadow_img, no_shadow_img) -> float:
+    # Lower MSE indicates better results
+    return np.mean((shadow_img - no_shadow_img) ** 2)
+
+def RMSE(shadow_img, no_shadow_img) -> float:
+    # Lower RMSE means better results
+    return sqrt(MSE(shadow_img, no_shadow_img))
+
+def PSNR(shadow_img, no_shadow_img) -> float:
+    # Higher PSNR means better results
+    mse = MSE(shadow_img, no_shadow_img)
+
+    if mse == 0:
+        return 100.0
+
+    max_pixel = 255.0
+    return 20 * log10(max_pixel / sqrt(mse))
 
 
 def SRI(img) -> float:
@@ -91,7 +120,7 @@ def GMS (mrsd, mnsd, c=0.0026) -> float:
     return top / bot
 
 
-def GMSD(shadow_img, no_shadow_img):
+def GMSD(shadow_img, no_shadow_img) -> float:
     # Lower value is better
     
     # Change images to grey
@@ -121,17 +150,17 @@ def GMSD(shadow_img, no_shadow_img):
 def main():
     # Argument Parser
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--mode", required=True, type=str, help="The processing mode for images: 'batch' or 'single'")
+    parser.add_argument("-m", "--mode", required=True, type=str, help="The processing mode for images: 'directory' or 'single'")
     parser.add_argument("-i", "--input_shadow", required=True, type=str, help="The path to the input directory or image with a shadow.")
     parser.add_argument("-n", "--input_no_shadow", required=True, type=str, help="The path to the input directory or image without shadow.")
-    parser.add_argument("-o", "--output_path", required=False, default="./eval", help="The path to the output directory.")
-    opts = vars(parser.parse_args())
+    parser.add_argument("-o", "--output_path", required=False, default="./runs/eval", help="The path to the output directory.")
+    opts = parser.parse_args()
     
     # Required Variables
-    input_shadow = opts["input_shadow"]
-    input_no_shadow = opts["input_no_shadow"]
-    output_dir = opts["output_path"]
-    mode = opts["mode"]
+    input_shadow = opts.input_shadow
+    input_no_shadow = opts.input_no_shadow
+    output_dir = opts.output_path
+    mode = opts.mode
     
     # Check if the files exist
     if not os.path.exists(input_shadow):
@@ -143,18 +172,58 @@ def main():
         exit()
             
     if not os.path.exists(output_dir):
-        os.mkdir(output_dir)
+        os.makedirs(output_dir)
         print(f"Output directory created: {output_dir}")
         
     # Single image case    
     if mode == "single":
         
-        # TODO: Add code to evaluate a single image
-        pass
-        
+        # All metrics
+        cd = 0
+        sri_1 = 0
+        sri_2 = 0
+        mse = 0
+        gmsd = 0
+        ssim = 0
+        psnr = 0
+
+        # Read the images
+        shadow_img = cv.imread(input_shadow)
+        no_shadow_img = cv.imread(input_no_shadow)
+
+        # Binary Version of the two images
+        shadow_img_bin = convert_to_binary(shadow_img)
+        no_shadow_img_bin = convert_to_binary(no_shadow_img)
+
+        cd = CD(shadow_img, no_shadow_img)
+        sri_1, sri_2 = compute_SRI(shadow_img, no_shadow_img)
+        mse = MSE(shadow_img_bin, no_shadow_img_bin)
+        gmsd = GMSD(shadow_img, no_shadow_img)
+        ssim, _ = ssim_fn(shadow_img_bin, no_shadow_img_bin, full=True)
+        psnr = PSNR(shadow_img_bin, no_shadow_img_bin)
+
+        # Print the results to the screen
+        print(f"Single Image Evaluation: {input_shadow}")
+        print("-" * 80)
+        print(f"CD: {cd:.5f}")
+        print(f"SRI: {(sri_2 - sri_1):.5f}")
+        print(f"MSE: {mse:.5f}")
+        print(f"GMSD: {gmsd:.5f}")
+        print(f"SSIM: {ssim:.5f}")
+        print(f"PSNR: {psnr:.5f}")
+        print("-" * 80)
+
     # Batch of images
-    elif mode == "batch":
+    elif mode == "directory":
         # TODO: Add code to evaluate a batch of images (directory)
+        # All Metrics
+        cd = []
+        sri = []
+        mse = []
+        gmsd = []
+        ssim = []
+        psnr = []
+
         pass
     else:
         print(f"ERROR: {mode} is unrecognised.")

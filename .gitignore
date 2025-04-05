@@ -1,3 +1,6 @@
-.vscode
-Data
+.vscode/
+.idea/
+Data/
 project_proposal.pptx
+runs/
+
