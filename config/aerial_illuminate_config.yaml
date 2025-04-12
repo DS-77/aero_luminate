@@ -1,0 +1,22 @@
+name: "Aerial-Illuminate"
+model_config:
+  lr: 1e-4
+  epochs: 20
+  batch_size: 16
+  load_model: False
+  number_workers: 1
+  train_img_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/train/shadow"
+  train_mask_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/train/mask"
+  valid_img_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/val/shadow"
+  valid_mask_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/val/mask"
+  test_img_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/test/shadow"
+  test_mask_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/test/mask"
+  output_path: "../run"
+
+adapter_shadow:
+  load_weights_path: ""
+  pre_train_weights_path: ""
+
+shadow_diff:
+  load_weights_path: ""
+  pre_train_weights_path: ""
