@@ -1,3 +1,6 @@
 [submodule "AdapterShadow"]
 	path = AdapterShadow
 	url = https://github.com/LeipingJie/AdapterShadow.git
+[submodule "shadowDiffusion"]
+	path = shadowDiffusion
+	url = https://github.com/GuoLanqing/ShadowDiffusion.git
