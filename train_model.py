@@ -7,21 +7,27 @@ Edited: 12-04-2025
 """
 
 import os
+import sys
 import tqdm
+import json
 import torch
-import logging
 import argparse
-from datetime import date
-
 from torch import Tensor
+from datetime import date
 from torch.optim import Adam
 from torch.optim import AdamW
 import torch.nn.functional as F
 import torchvision.models as models
+import shadowDiffusion.model as Model
 from config.config import load_config
+from utils.dataset import AISD_dataset
 from torch.utils.data import DataLoader
+import shadowDiffusion.core.logger as Logger
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from AdapterShadow.models_exp.sam import SamPredictor, sam_model_registry
+
+sys.path.append(os.path.abspath("shadowDiffusion"))
 
 
 def combined_loss_fn(original_img, shadow_mask_pred, ground_truth_mask, shadow_remove_img) -> Tensor:
@@ -67,20 +73,31 @@ if __name__ == "__main__":
     configs = load_config(conf_file)
 
     # Training data path
-    training_img_path = configs["model_config"]["training_img_path"]
-    training_mask_path = configs["model_config"]["training_mask_path"]
+    train_img_path = configs["model_config"]["train_img_path"]
+    train_mask_path = configs["model_config"]["train_mask_path"]
+    valid_img_path = configs["model_config"]["valid_img_path"]
+    valid_mask_path = configs["model_config"]["valid_mask_path"]
 
-    if not os.path.exists(training_img_path):
-        print(f"ERROR: Training image path does not exist: '{training_img_path}'")
+    if not os.path.exists(train_img_path):
+        print(f"ERROR: Training image path does not exist: '{train_img_path}'")
         exit()
 
-    if not os.path.exists(training_mask_path):
-        print(f"ERROR: Training image path does not exist: '{training_mask_path}'")
+    if not os.path.exists(train_mask_path):
+        print(f"ERROR: Training image path does not exist: '{train_mask_path}'")
+        exit()
+
+    if not os.path.exists(valid_img_path):
+        print(f"ERROR: Validation image path does not exist: '{valid_img_path}'")
+        exit()
+
+    if not os.path.exists(valid_mask_path):
+        print(f"ERROR: Validation mask path does not exist: '{valid_mask_path}'")
         exit()
 
     # Create required directories
     output_path_root = opts.out_dir if opts.out_dir is not None else configs["model_config"]["output_path"]
-    output_path = os.path.join(output_path_root, "train")
+    temp_output_path = os.path.join(output_path_root, "train")
+    output_path = os.path.join(temp_output_path, f"exp_{date.today()}")
     weights_path = os.path.join(output_path, "weights")
     log_path = os.path.join(output_path, "logs")
 
@@ -89,6 +106,10 @@ if __name__ == "__main__":
         os.mkdir(output_path_root)
 
     # Train Dir Path
+    if not os.path.exists(temp_output_path):
+        os.mkdir(temp_output_path)
+
+    # Experiment Dir Path
     if not os.path.exists(output_path):
         os.mkdir(output_path)
 
@@ -101,17 +122,86 @@ if __name__ == "__main__":
         os.mkdir(weights_path)
 
     # Load dataset
+    train_dataset = AISD_dataset(train_img_path, train_mask_path)
+    valid_dataset = AISD_dataset(valid_img_path, valid_mask_path)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=configs["model_config"]["batch_size"], shuffle=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+
+    # print(f"Train set: {train_dataset.__len__()}")
+    # print(f"Valid set: {valid_dataset.__len__()}")
+    # exit()
 
     # Device selection
-    device = "gpu" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Initialise the models
-    adapter_shadow = None
-    shadow_diff = None
+
+    # Adapter Shadow Configs
+    adapter_args = argparse.Namespace()
+    adapter_args.vpt = True
+    adapter_args.all = True
+    adapter_args.net = "sam"
+    adapter_args.lora = True
+    adapter_args.backbone = "b5"
+    adapter_args.ratio_bt = 1.0
+    adapter_args.mb_ratio = 0.25
+    adapter_args.small_size = True
+    adapter_args.multi_branch = True
+    adapter_args.skip_adapter = True
+    adapter_args.plug_image_adapter = True
+
+    # Shadow Diffusion Configs
+    shadow_diff_config_path = configs["shadow_diff"]["config_json"]
+    with open(shadow_diff_config_path, 'r') as f:
+        shadow_diff_opt = json.load(f)
+
+    adapter_shadow = sam_model_registry['vit_b'](adapter_args, checkpoint=configs["adapter_shadow"]["pre_train_weights_path"])
+    shadow_diff = Model.create_model(shadow_diff_opt)
+    shadow_diff.set_new_noise_schedule(
+        shadow_diff_opt['model']['beta_schedule']['train'], schedule_phase='train'
+    )
+
+    print(f"Device: {device}")
+    adapter_shadow = adapter_shadow.to(device)
+    # shadow_diff = shadow_diff.to(device)
 
     optimiser = Adam(list (adapter_shadow.parameters()) + list (shadow_diff.parameters()), lr=configs["model_config"]["lr"])
     scheduler = ReduceLROnPlateau(optimiser, mode='min', patience=3, factor=0.5)
 
     # Run training loop
+    num_epochs = configs["model_config"]["epochs"]
+    best_loss = int("inf")
 
-        # Save best models
+    # TODO: Add TensorBoard monitoring
+    for epoch in tqdm.tqdm(range(num_epochs)):
+        for batch_index, (imgs, masks) in enumerate(train_dataloader):
+            imgs = imgs.to(device)
+            masks = masks.to(device)
+
+            # Predict shadow mask
+            pred_shadow_masks = adapter_shadow(imgs)
+
+            # Remove shadow
+            no_shadow_imgs = shadow_diff(pred_shadow_masks, imgs)
+
+            # Compute the loss
+            loss = combined_loss_fn(imgs, pred_shadow_masks, masks, no_shadow_imgs)
+
+            # Backprop
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+
+            # Save models every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                torch.save(adapter_shadow.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_adapt_shadow.pth"))
+                torch.save(shadow_diff.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_shadow_diff.pth"))
+
+            # Save best models
+            if loss < best_loss:
+                best_loss = loss
+                torch.save(adapter_shadow.state_dict(),
+                           os.path.join(weights_path, f"best_checkpoint_adapt_shadow.pth"))
+                torch.save(shadow_diff.state_dict(),
+                           os.path.join(weights_path, f"best_checkpoint_shadow_diff.pth"))
