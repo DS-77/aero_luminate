@@ -172,7 +172,9 @@ if __name__ == "__main__":
     num_epochs = configs["model_config"]["epochs"]
     best_loss = float("inf")
 
-    # TODO: Add TensorBoard monitoring
+    # TensorBoard monitoring
+    writer = SummaryWriter(log_dir=log_path)
+
     for epoch in tqdm.tqdm(range(num_epochs)):
         for batch_index, (imgs, masks) in enumerate(train_dataloader):
             imgs = imgs.to(device)
@@ -192,6 +194,9 @@ if __name__ == "__main__":
             loss.backward()
             optimiser.step()
 
+            # Log to TensorBoard
+            writer.add_scalar('Loss/train', loss.item(), epoch * len(train_dataloader) + batch_index)
+
             # Save models every 5 epochs
             if (epoch + 1) % 5 == 0:
                 torch.save(adapter_shadow.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_adapt_shadow.pth"))
@@ -204,3 +209,5 @@ if __name__ == "__main__":
                            os.path.join(weights_path, f"best_checkpoint_adapt_shadow.pth"))
                 torch.save(shadow_diff.state_dict(),
                            os.path.join(weights_path, f"best_checkpoint_shadow_diff.pth"))
+
+    writer.close()
