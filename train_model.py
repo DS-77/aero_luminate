@@ -7,7 +7,6 @@ Edited: 19-04-2025
 """
 
 import os
-import sys
 import tqdm
 import json
 import torch
@@ -16,13 +15,12 @@ from torch import Tensor
 from datetime import date
 from torch.optim import Adam
 from torch.optim import AdamW
-from models import shadow_diff
 import torch.nn.functional as F
 import torchvision.models as models
-from config.config import load_config
+from configs.config import load_config
 from utils.dataset import AISD_dataset
 from torch.utils.data import DataLoader
-import shadowDiffusion.core.logger as Logger
+from models import shadow_diff, adapter_shadow
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -154,7 +152,7 @@ if __name__ == "__main__":
         shadow_diff_opt = json.load(f)
 
     # Adapter Shadow Model
-    adapter_shadow = sam_model_registry['vit_b'](adapter_args, checkpoint=configs["adapter_shadow"]["pre_train_weights_path"])
+    adapter_shadow = adapter_shadow.adapt_sam_model_registry('vit_b', None, checkpoint=configs["adapter_shadow"]["pre_train_weights_path"])
 
     # Shadow Diffusion Model
     shadow_diff = shadow_diff.create_model(shadow_diff_opt)
@@ -167,12 +165,12 @@ if __name__ == "__main__":
     adapter_shadow = adapter_shadow.to(device)
     shadow_diff = shadow_diff.to(device)
 
-    optimiser = Adam(list (adapter_shadow.parameters()) + list (shadow_diff.parameters()), lr=configs["model_config"]["lr"])
+    optimiser = Adam(list (adapter_shadow.parameters()) + list (shadow_diff.parameters()), lr=float(configs["model_config"]["lr"]))
     scheduler = ReduceLROnPlateau(optimiser, mode='min', patience=3, factor=0.5)
 
     # Run training loop
     num_epochs = configs["model_config"]["epochs"]
-    best_loss = int("inf")
+    best_loss = float("inf")
 
     # TODO: Add TensorBoard monitoring
     for epoch in tqdm.tqdm(range(num_epochs)):

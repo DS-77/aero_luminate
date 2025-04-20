@@ -28,11 +28,17 @@ def default(val, d):
     return d() if isfunction(d) else d
 
 
+# def extract(a, t, x_shape):
+#     batch_size = t.shape[0]
+#     out = a.gather(-1, t.cpu())
+#     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+
 def extract(a, t, x_shape):
     batch_size = t.shape[0]
-    out = a.gather(-1, t.cpu())
-    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
-
+    device = a.device  # Get the device of tensor 'a'
+    t = t.to(device) # Move 't' to the same device as 'a'
+    out = a.gather(-1, t)
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
 
 # Positional encodings
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -172,7 +178,8 @@ class ShadowDiffusionUNet(nn.Module):
         self.bot1 = DoubleConv(1024, 1024)
         self.bot2 = DoubleConv(1024, 1024)
         self.bot3 = DoubleConv(1024, 1024)
-        self.bot_sa = SelfAttention(1024, 16)  # Size at bottleneck for 512x512: 32x32
+        # Size at bottleneck for 512x512: 32x32
+        self.bot_sa = SelfAttention(1024, 16)
 
         # Decoder
         self.up1 = Up(1024 + 512, 512, emb_dim=time_emb_dim)
@@ -257,13 +264,13 @@ class GaussianDiffusion(nn.Module):
         # Calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer('sqrt_alphas_cumprod_prev', torch.cat([torch.ones(1), self.sqrt_alphas_cumprod[:-1]]))
         # Calculations for posterior q(x_{t-1} | x_t, x_0)
-        posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+        posterior_variance = self.betas * (1. - self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.register_buffer('posterior_variance', posterior_variance)
         self.register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1',
-                             self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod))
+                             self.betas * torch.sqrt(self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod))
         self.register_buffer('posterior_mean_coef2',
-                             (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod))
+                             (1. - self.sqrt_alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod))
 
     # Forward diffusion (add noise)
     def q_sample(self, x_0, t, noise=None):
@@ -374,12 +381,18 @@ class GaussianDiffusion(nn.Module):
 
 
 # Create the complete model
-def create_model(opts):
+def create_model(opts, mode="train"):
     # Create diffusion schedule
-    timesteps = opts['model']['timesteps']
-    beta_start = opts['model']['beta_schedule']['start']
-    beta_end = opts['model']['beta_schedule']['end']
-    betas = torch.linspace(beta_start, beta_end, timesteps)
+    if mode == "train":
+        timesteps = opts['model']['beta_schedule']['train']['n_timestep']
+        beta_start = opts['model']['beta_schedule']['train']['linear_start']
+        beta_end = opts['model']['beta_schedule']['train']['linear_end']
+        betas = torch.linspace(beta_start, beta_end, timesteps)
+    else:
+        timesteps = opts['model']['beta_schedule']['val']['n_timestep']
+        beta_start = opts['model']['beta_schedule']['val']['linear_start']
+        beta_end = opts['model']['beta_schedule']['val']['linear_end']
+        betas = torch.linspace(beta_start, beta_end, timesteps)
 
     # Create U-Net model
     model = ShadowDiffusionUNet(
@@ -413,9 +426,9 @@ def set_new_noise_schedule(self, schedule_opt, schedule_phase='train'):
     device = self.betas.device
 
     if schedule_phase == 'train':
-        timesteps = schedule_opt['timesteps']
-        beta_start = schedule_opt['start']
-        beta_end = schedule_opt['end']
+        timesteps = schedule_opt['n_timestep']
+        beta_start = schedule_opt['linear_start']
+        beta_end = schedule_opt['linear_end']
         betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
 
         self.betas = betas
@@ -429,11 +442,11 @@ def set_new_noise_schedule(self, schedule_opt, schedule_phase='train'):
         # Calculations for diffusion q(x_t | x_{t-1}) and others
         self.sqrt_alphas_cumprod_prev = torch.cat([torch.ones(1, device=device), self.sqrt_alphas_cumprod[:-1]])
         # Calculations for posterior q(x_{t-1} | x_t, x_0)
-        posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+        posterior_variance = self.betas * (1. - self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_variance = posterior_variance
         self.posterior_log_variance_clipped = torch.log(posterior_variance.clamp(min=1e-20))
-        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (
+        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+        self.posterior_mean_coef2 = (1. - self.sqrt_alphas_cumprod_prev) * torch.sqrt(self.alphas) / (
                     1. - self.alphas_cumprod)
     else:
         raise NotImplementedError(f"Schedule phase {schedule_phase} not recognized.")
