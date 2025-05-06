@@ -15,6 +15,8 @@
 
 ## How to Install
 
+It is recommended that you have Python 3.12 or greater.
+
 #### Rocm
 
 ```commandline
@@ -28,8 +30,23 @@ conda activate aero_shadow
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ````
 
+## How to Train
+
+```commandline
+python train_model.py -c <path to config file>
+
+Example: python train_model.py -c configs/aero_luminate_config.yaml
+```
+If you would like to train our model on your own dataset, alter the file paths in the `configs/aero_luminate_config.yaml`.
+You will also need to create a class for your dataset in the `utils/dataset.py`.
+
+> You can find the weights and logs in a generated `runs` directory after executing the command.
+
 ## How to Run
 
+```commandline
+python 
+```
 
 # Troubleshooting
 
