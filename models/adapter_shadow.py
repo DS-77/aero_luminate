@@ -675,7 +675,7 @@ class AdaptedImageEncoder(nn.Module):
         shadow_mask = self.upsample(features)
 
         # Apply sigmoid for binary mask
-        shadow_mask = torch.sigmoid(shadow_mask)
+        # shadow_mask = torch.sigmoid(shadow_mask)
 
         return shadow_mask
 

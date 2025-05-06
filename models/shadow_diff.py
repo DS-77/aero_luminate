@@ -1,10 +1,10 @@
 """
-This module is a modified implementation of the Shadow Diffusion Model by Lanqing Guo et al. described in their paper
+This module is an optimized implementation of the Shadow Diffusion Model by Lanqing Guo et al. described in their paper
 "ShadowDiffusion: When Degradation Prior Meets Diffusion Model for Shadow Removal."
 
 Author: Deja S.
-Version: 1.0.0
-Edited: 19-04-2025
+Version: 1.1.0
+Edited: 03-05-2025
 """
 
 import math
@@ -28,17 +28,13 @@ def default(val, d):
     return d() if isfunction(d) else d
 
 
-# def extract(a, t, x_shape):
-#     batch_size = t.shape[0]
-#     out = a.gather(-1, t.cpu())
-#     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
-
 def extract(a, t, x_shape):
     batch_size = t.shape[0]
-    device = a.device  # Get the device of tensor 'a'
-    t = t.to(device) # Move 't' to the same device as 'a'
+    device = a.device
+    t = t.to(device)
     out = a.gather(-1, t)
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
+
 
 # Positional encodings
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -120,33 +116,99 @@ class Up(nn.Module):
         return x + emb
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, channels, size):
-        super(SelfAttention, self).__init__()
+# Memory-efficient implementation of self-attention
+class EfficientSelfAttention(nn.Module):
+    def __init__(self, channels, size, heads=4, head_dim=None, downsample_factor=4):
+        super(EfficientSelfAttention, self).__init__()
         self.channels = channels
         self.size = size
-        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
-        self.ln = nn.LayerNorm([channels])
-        self.ff_self = nn.Sequential(
-            nn.LayerNorm([channels]),
-            nn.Linear(channels, channels),
+        self.heads = heads
+        self.downsample_factor = downsample_factor
+
+        # Reduce spatial dimensions to save memory
+        self.spatial_size = size // downsample_factor if size > downsample_factor else 1
+
+        # Define head dimensions
+        if head_dim is None:
+            head_dim = channels // heads
+
+        # Multi-head attention with linear projections
+        self.q_proj = nn.Linear(channels, channels)
+        self.k_proj = nn.Linear(channels, channels)
+        self.v_proj = nn.Linear(channels, channels)
+        self.out_proj = nn.Linear(channels, channels)
+
+        self.norm1 = nn.LayerNorm([channels])
+        self.norm2 = nn.LayerNorm([channels])
+
+        # Feed-forward network
+        self.ff = nn.Sequential(
+            nn.Linear(channels, channels * 2),
             nn.GELU(),
-            nn.Linear(channels, channels),
+            nn.Linear(channels * 2, channels),
         )
 
+        # Spatial reduction
+        self.spatial_reduction = nn.AvgPool2d(downsample_factor) if downsample_factor > 1 else nn.Identity()
+        self.spatial_restore = nn.Upsample(scale_factor=downsample_factor,
+                                           mode='bilinear') if downsample_factor > 1 else nn.Identity()
+
     def forward(self, x):
-        x = x.view(-1, self.channels, self.size * self.size).swapaxes(1, 2)
-        x_ln = self.ln(x)
-        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
-        return attention_value.swapaxes(2, 1).view(-1, self.channels, self.size, self.size)
+        # Store original shape
+        B, C, H, W = x.shape
+        residual = x
+
+        # Reshape for attention
+        x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # B, H*W, C
+        x_norm = self.norm1(x_flat)
+
+        original_seq_len = x_norm.shape[1]
+
+        if self.downsample_factor > 1:
+            # Reshape to spatial format for downsampling
+            x_spatial = x_norm.permute(0, 2, 1).view(B, C, H, W)
+            x_down = self.spatial_reduction(x_spatial)
+            x_norm = x_down.view(B, C, -1).permute(0, 2, 1)  # B, (H/d)*(W/d), C
+
+            down_seq_len = x_norm.shape[1]
+
+        # Split into heads
+        q = self.q_proj(x_norm).view(B, -1, self.heads, C // self.heads).permute(0, 2, 1, 3)  # B, h, L, d
+
+        # Use downsampled features for keys and values
+        k = self.k_proj(x_norm).view(B, -1, self.heads, C // self.heads).permute(0, 2, 1, 3)  # B, h, L, d
+        v = self.v_proj(x_norm).view(B, -1, self.heads, C // self.heads).permute(0, 2, 1, 3)  # B, h, L, d
+
+        with torch.cuda.amp.autocast(enabled=True):
+            # Calculate attention scores
+            attention_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(C // self.heads)
+            attention_probs = F.softmax(attention_scores, dim=-1)
+
+            # Apply attention to values
+            context = torch.matmul(attention_probs, v).permute(0, 2, 1, 3).contiguous()
+            context = context.view(B, -1, C)
+            context = self.out_proj(context)
+
+            if self.downsample_factor > 1:
+                down_h, down_w = H // self.downsample_factor, W // self.downsample_factor
+                context = context.permute(0, 2, 1).view(B, C, down_h, down_w)
+                context = self.spatial_restore(context)
+                context = context.view(B, C, H * W).permute(0, 2, 1)
+
+            context = context + x_flat
+
+        context = self.norm2(context)
+        ff_output = self.ff(context)
+        output = ff_output + context
+        output = output.permute(0, 2, 1).view(B, C, H, W)
+        return output + residual
 
 
 # U-Net with timestep embedding and attention
 class ShadowDiffusionUNet(nn.Module):
-    def __init__(self, in_channels=4, out_channels=3, time_emb_dim=256):
+    def __init__(self, in_channels=4, out_channels=3, time_emb_dim=256, base_channels=32, use_checkpoint=True):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
 
         # Time embedding
         self.time_mlp = nn.Sequential(
@@ -155,93 +217,112 @@ class ShadowDiffusionUNet(nn.Module):
             nn.GELU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
+        c = base_channels
 
         # Initial projection
-        self.conv0 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1)
+        self.conv0 = nn.Conv2d(in_channels, c, kernel_size=3, padding=1)
 
-        # Encoder
-        self.inc = DoubleConv(64, 64, residual=True)
-        self.down1 = Down(64, 128, emb_dim=time_emb_dim)
-        # Size after down1 for 512x512: 256x256
-        self.sa1 = SelfAttention(128, 128)
-        self.down2 = Down(128, 256, emb_dim=time_emb_dim)
-        # Size after down2 for 512x512: 128x128
-        self.sa2 = SelfAttention(256, 64)
-        self.down3 = Down(256, 512, emb_dim=time_emb_dim)
-        # Size after down3 for 512x512: 64x64
-        self.sa3 = SelfAttention(512, 32)
-        self.down4 = Down(512, 1024, emb_dim=time_emb_dim)
-        # Size after down4 for 512x512: 32x32
-        self.sa4 = SelfAttention(1024, 16)
+        # Encoder with reduced channels
+        self.inc = DoubleConv(c, c, residual=True)
+        self.down1 = Down(c, c * 2, emb_dim=time_emb_dim)
+        self.sa1 = EfficientSelfAttention(c * 2, 128, downsample_factor=4)
+        self.down2 = Down(c * 2, c * 4, emb_dim=time_emb_dim)
+        self.sa2 = EfficientSelfAttention(c * 4, 64, downsample_factor=4)
+        self.down3 = Down(c * 4, c * 8, emb_dim=time_emb_dim)
+        self.sa3 = EfficientSelfAttention(c * 8, 32, downsample_factor=2)
+        self.down4 = Down(c * 8, c * 16, emb_dim=time_emb_dim)
+        self.sa4 = EfficientSelfAttention(c * 16, 16, downsample_factor=2)
 
-        # Bottleneck
-        self.bot1 = DoubleConv(1024, 1024)
-        self.bot2 = DoubleConv(1024, 1024)
-        self.bot3 = DoubleConv(1024, 1024)
-        # Size at bottleneck for 512x512: 32x32
-        self.bot_sa = SelfAttention(1024, 16)
+        # Bottleneck with reduced channels
+        self.bot1 = DoubleConv(c * 16, c * 16)
+        self.bot2 = DoubleConv(c * 16, c * 16)
+        self.bot3 = DoubleConv(c * 16, c * 16)
+        self.bot_sa = EfficientSelfAttention(c * 16, 16, downsample_factor=1)
 
-        # Decoder
-        self.up1 = Up(1024 + 512, 512, emb_dim=time_emb_dim)
-        # Size after up1 for 512x512: 64x64
-        self.sa5 = SelfAttention(512, 32)
-        self.up2 = Up(512 + 256, 256, emb_dim=time_emb_dim)
-        # Size after up2 for 512x512: 128x128
-        self.sa6 = SelfAttention(256, 64)
-        self.up3 = Up(256 + 128, 128, emb_dim=time_emb_dim)
-        # Size after up3 for 512x512: 256x256
-        self.sa7 = SelfAttention(128, 128)
-        self.up4 = Up(128 + 64, 64, emb_dim=time_emb_dim)
+        # Decoder with reduced channels
+        self.up1 = Up(c * 16 + c * 8, c * 8, emb_dim=time_emb_dim)
+        self.sa5 = EfficientSelfAttention(c * 8, 32, downsample_factor=2)
+        self.up2 = Up(c * 8 + c * 4, c * 4, emb_dim=time_emb_dim)
+        self.sa6 = EfficientSelfAttention(c * 4, 64, downsample_factor=4)
+        self.up3 = Up(c * 4 + c * 2, c * 2, emb_dim=time_emb_dim)
+        self.sa7 = EfficientSelfAttention(c * 2, 128, downsample_factor=4)
+        self.up4 = Up(c * 2 + c, c, emb_dim=time_emb_dim)
 
         # Output
         self.outc = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(1, 64),
+            nn.Conv2d(c, c, kernel_size=3, padding=1),
+            nn.GroupNorm(1, c),
             nn.GELU(),
-            nn.Conv2d(64, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(c, out_channels, kernel_size=3, padding=1),
         )
 
     def forward(self, x, shadow_mask, t):
-        # Concatenate shadow image with shadow mask
-        x = torch.cat([x, shadow_mask], dim=1)
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
 
-        # Initial projection
-        x = self.conv0(x)
+            return custom_forward
 
-        # Time embedding
-        t = self.time_mlp(t)
+        # Lower precision for efficient computation
+        with torch.cuda.amp.autocast(enabled=True):
+            x = torch.cat([x, shadow_mask], dim=1)
+            x = self.conv0(x)
+            t = self.time_mlp(t)
+            x1 = self.inc(x)
 
-        # Encoder path with skip connections
-        x1 = self.inc(x)
-        x2 = self.down1(x1, t)
-        x2 = self.sa1(x2)
-        x3 = self.down2(x2, t)
-        x3 = self.sa2(x3)
-        x4 = self.down3(x3, t)
-        x4 = self.sa3(x4)
-        x5 = self.down4(x4, t)
-        x5 = self.sa4(x5)
+            # Apply gradient checkpointing
+            if self.use_checkpoint and self.training:
+                x2 = torch.utils.checkpoint.checkpoint(create_custom_forward(self.down1), x1, t)
+                x2 = torch.utils.checkpoint.checkpoint(self.sa1, x2)
+                x3 = torch.utils.checkpoint.checkpoint(create_custom_forward(self.down2), x2, t)
+                x3 = torch.utils.checkpoint.checkpoint(self.sa2, x3)
+                x4 = torch.utils.checkpoint.checkpoint(create_custom_forward(self.down3), x3, t)
+                x4 = torch.utils.checkpoint.checkpoint(self.sa3, x4)
+                x5 = torch.utils.checkpoint.checkpoint(create_custom_forward(self.down4), x4, t)
+                x5 = torch.utils.checkpoint.checkpoint(self.sa4, x5)
 
-        # Bottleneck
-        x5 = self.bot1(x5)
-        x5 = self.bot2(x5)
-        x5 = self.bot3(x5)
-        x5 = self.bot_sa(x5)
+                # Bottleneck
+                x5 = torch.utils.checkpoint.checkpoint(self.bot1, x5)
+                x5 = torch.utils.checkpoint.checkpoint(self.bot2, x5)
+                x5 = torch.utils.checkpoint.checkpoint(self.bot3, x5)
+                x5 = torch.utils.checkpoint.checkpoint(self.bot_sa, x5)
 
-        # Decoder with skip connections
-        x = self.up1(x5, x4, t)
-        x = self.sa5(x)
-        x = self.up2(x, x3, t)
-        x = self.sa6(x)
-        x = self.up3(x, x2, t)
-        x = self.sa7(x)
-        x = self.up4(x, x1, t)
+                # Decoder with skip connections
+                x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.up1), x5, x4, t)
+                x = torch.utils.checkpoint.checkpoint(self.sa5, x)
+                x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.up2), x, x3, t)
+                x = torch.utils.checkpoint.checkpoint(self.sa6, x)
+                x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.up3), x, x2, t)
+                x = torch.utils.checkpoint.checkpoint(self.sa7, x)
+                x = torch.utils.checkpoint.checkpoint(create_custom_forward(self.up4), x, x1, t)
+            else:
+                x2 = self.down1(x1, t)
+                x2 = self.sa1(x2)
+                x3 = self.down2(x2, t)
+                x3 = self.sa2(x3)
+                x4 = self.down3(x3, t)
+                x4 = self.sa3(x4)
+                x5 = self.down4(x4, t)
+                x5 = self.sa4(x5)
 
-        # Output projection
-        output = self.outc(x)
+                # Bottleneck
+                x5 = self.bot1(x5)
+                x5 = self.bot2(x5)
+                x5 = self.bot3(x5)
+                x5 = self.bot_sa(x5)
 
-        # Return shadow-free image
-        return output
+                # Decoder with skip connections
+                x = self.up1(x5, x4, t)
+                x = self.sa5(x)
+                x = self.up2(x, x3, t)
+                x = self.sa6(x)
+                x = self.up3(x, x2, t)
+                x = self.sa7(x)
+                x = self.up4(x, x1, t)
+
+            # Output projection
+            output = self.outc(x)
+            return output
 
 
 # Diffusion model core components
@@ -260,19 +341,18 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - self.alphas_cumprod))
         self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / self.alphas))
         self.register_buffer('sqrt_recipm1_alphas', torch.sqrt(1.0 / self.alphas - 1))
-
-        # Calculations for diffusion q(x_t | x_{t-1}) and others
-        self.register_buffer('sqrt_alphas_cumprod_prev', torch.cat([torch.ones(1), self.sqrt_alphas_cumprod[:-1]]))
-        # Calculations for posterior q(x_{t-1} | x_t, x_0)
+        self.register_buffer('sqrt_alphas_cumprod_prev',
+                             torch.cat([torch.ones(1, device=betas.device), self.sqrt_alphas_cumprod[:-1]]))
         posterior_variance = self.betas * (1. - self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.register_buffer('posterior_variance', posterior_variance)
         self.register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1',
                              self.betas * torch.sqrt(self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod))
         self.register_buffer('posterior_mean_coef2',
-                             (1. - self.sqrt_alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod))
+                             (1. - self.sqrt_alphas_cumprod_prev) * torch.sqrt(self.alphas) / (
+                                         1. - self.alphas_cumprod))
 
-    # Forward diffusion (add noise)
+    # Forward diffusion
     def q_sample(self, x_0, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_0)
@@ -282,14 +362,12 @@ class GaussianDiffusion(nn.Module):
 
         return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
 
-    # Get the predicted x_0 from x_t and predicted noise
     def predict_start_from_noise(self, x_t, t, noise):
         sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x_t.shape)
         sqrt_recipm1_alphas_t = extract(self.sqrt_recipm1_alphas, t, x_t.shape)
 
         return sqrt_recip_alphas_t * x_t - sqrt_recipm1_alphas_t * noise
 
-    # Get the mean for posterior distribution q(x_{t-1} | x_t, x_0)
     def q_posterior_mean(self, x_0, x_t, t):
         posterior_mean_coef1_t = extract(self.posterior_mean_coef1, t, x_t.shape)
         posterior_mean_coef2_t = extract(self.posterior_mean_coef2, t, x_t.shape)
@@ -297,48 +375,41 @@ class GaussianDiffusion(nn.Module):
         mean = posterior_mean_coef1_t * x_0 + posterior_mean_coef2_t * x_t
         return mean
 
-    # Get the variance and log variance for q(x_{t-1} | x_t, x_0)
     def q_posterior_variance_and_log(self, t):
         posterior_variance_t = extract(self.posterior_variance, t, (t.shape[0],))
         posterior_log_variance_t = extract(self.posterior_log_variance_clipped, t, (t.shape[0],))
         return posterior_variance_t, posterior_log_variance_t
 
-    # Forward pass
     def forward(self, shadow_mask, x_0):
-        t = torch.randint(0, len(self.betas), (x_0.shape[0],), device=x_0.device).long()
-        noise = torch.randn_like(x_0)
-        x_t = self.q_sample(x_0, t, noise)
+        with torch.cuda.amp.autocast(enabled=True):
+            t = torch.randint(0, len(self.betas), (x_0.shape[0],), device=x_0.device).long()
+            noise = torch.randn_like(x_0)
+            x_t = self.q_sample(x_0, t, noise)
+            predicted_noise = self.model(x_t, shadow_mask, t)
 
-        # Predict the noise
-        predicted_noise = self.model(x_t, shadow_mask, t)
-
-        # Loss is MSE between predicted and actual noise
-        loss = F.mse_loss(predicted_noise, noise)
+            loss = F.mse_loss(predicted_noise, noise)
 
         return loss
 
-    # Sampling
     @torch.no_grad()
     def p_sample(self, shadow_mask, x, t, t_index):
-        betas_t = extract(self.betas, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
-        sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
+        with torch.cuda.amp.autocast(enabled=True):
+            betas_t = extract(self.betas, t, x.shape)
+            sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+            sqrt_recip_alphas_t = extract(self.sqrt_recip_alphas, t, x.shape)
+            model_mean = sqrt_recip_alphas_t * (
+                    x - betas_t * self.model(x, shadow_mask, t) / sqrt_one_minus_alphas_cumprod_t
+            )
 
-        # Predict noise
-        model_mean = sqrt_recip_alphas_t * (
-                x - betas_t * self.model(x, shadow_mask, t) / sqrt_one_minus_alphas_cumprod_t
-        )
+            if t_index == 0:
+                return model_mean
+            else:
+                posterior_variance_t = extract(self.posterior_variance, t, x.shape)
+                noise = torch.randn_like(x)
+                return model_mean + torch.sqrt(posterior_variance_t) * noise
 
-        if t_index == 0:
-            return model_mean
-        else:
-            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
-            noise = torch.randn_like(x)
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
-
-    # Generate samples with progressive denoising
     @torch.no_grad()
-    def sample(self, shadow_mask, image_size=None, batch_size=1, channels=None, device=None):
+    def sample(self, shadow_mask, image_size=None, batch_size=1, channels=None, device=None, steps=100):
         if image_size is None:
             image_size = self.image_size
         if channels is None:
@@ -348,39 +419,40 @@ class GaussianDiffusion(nn.Module):
 
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=device)
+        time_steps = torch.linspace(len(self.betas) - 1, 0, steps, dtype=torch.long, device=device)
 
-        for i in reversed(range(0, len(self.betas))):
-            img = self.p_sample(
-                shadow_mask,
-                img,
-                torch.full((batch_size,), i, device=device, dtype=torch.long),
-                i
-            )
+        for i, step in enumerate(time_steps):
+            if i % 10 == 0 and i > 0:
+                torch.cuda.empty_cache()
+
+            with torch.cuda.amp.autocast(enabled=True):
+                img = self.p_sample(
+                    shadow_mask,
+                    img,
+                    step.expand(batch_size),
+                    i
+                )
 
         return img
 
-    # Remove shadows from input image with shadow mask
-    def __call__(self, shadow_mask, shadow_img):
+    def __call__(self, shadow_mask, shadow_img, steps=50):
         batch_size = shadow_img.shape[0]
         device = shadow_img.device
-
-        # Generate shadow-free image through denoising process
-        steps = 100
-
-        # Start from a random noise image
+        steps = min(steps, len(self.betas))
         x = torch.randn(shadow_img.shape, device=device)
+        time_steps = torch.linspace(len(self.betas) - 1, 0, steps, dtype=torch.long, device=device)
 
-        # Progressive denoising
-        for i in reversed(range(0, len(self.betas), len(self.betas) // steps)):
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
+        for i, step in enumerate(time_steps):
+            if i % 10 == 0 and i > 0:
+                torch.cuda.empty_cache()
+
+            t = step.expand(batch_size)
             x = self.p_sample(shadow_mask, x, t, i)
 
-        # Ensure output is in valid image range
         x = torch.clamp(x, -1, 1)
         return x
 
 
-# Create the complete model
 def create_model(opts, mode="train"):
     # Create diffusion schedule
     if mode == "train":
@@ -394,11 +466,12 @@ def create_model(opts, mode="train"):
         beta_end = opts['model']['beta_schedule']['val']['linear_end']
         betas = torch.linspace(beta_start, beta_end, timesteps)
 
-    # Create U-Net model
     model = ShadowDiffusionUNet(
         in_channels=4,
         out_channels=3,
-        time_emb_dim=256
+        time_emb_dim=256,
+        base_channels=32,
+        use_checkpoint=True
     )
 
     # Create diffusion model
@@ -417,11 +490,16 @@ def create_model(opts, mode="train"):
 
 
 def load_model_state(model, checkpoint_path):
-    model.load_state_dict(torch.load(checkpoint_path))
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    try:
+        model.load_state_dict(checkpoint)
+    except Exception as e:
+        # Print warning and try loading with strict=False
+        print(f"Warning: Could not load checkpoint strictly. Error: {e}")
+        print("Attempting to load with strict=False")
+        model.load_state_dict(checkpoint, strict=False)
     return model
 
-
-# Method to set new noise schedules
 def set_new_noise_schedule(self, schedule_opt, schedule_phase='train'):
     device = self.betas.device
 
@@ -438,19 +516,15 @@ def set_new_noise_schedule(self, schedule_opt, schedule_phase='train'):
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
         self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
         self.sqrt_recipm1_alphas = torch.sqrt(1.0 / self.alphas - 1)
-
-        # Calculations for diffusion q(x_t | x_{t-1}) and others
         self.sqrt_alphas_cumprod_prev = torch.cat([torch.ones(1, device=device), self.sqrt_alphas_cumprod[:-1]])
-        # Calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = self.betas * (1. - self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_variance = posterior_variance
         self.posterior_log_variance_clipped = torch.log(posterior_variance.clamp(min=1e-20))
         self.posterior_mean_coef1 = self.betas * torch.sqrt(self.sqrt_alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1. - self.sqrt_alphas_cumprod_prev) * torch.sqrt(self.alphas) / (
-                    1. - self.alphas_cumprod)
+                1. - self.alphas_cumprod)
     else:
         raise NotImplementedError(f"Schedule phase {schedule_phase} not recognized.")
-
 
 # Add the method to the GaussianDiffusion class
 GaussianDiffusion.set_new_noise_schedule = set_new_noise_schedule

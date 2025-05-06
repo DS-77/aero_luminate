@@ -2,7 +2,7 @@ name: "Aero-Luminate"
 model_config:
   lr: 1e-4
   epochs: 20
-  batch_size: 16
+  batch_size: 8
   load_model: False
   number_workers: 1
   train_img_path: "/run/media/th/Vault-Lab/Shadow_Detect_Removal/Data/AISD/train/shadow"

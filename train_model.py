@@ -44,9 +44,10 @@ def combined_loss_fn(original_img, shadow_mask_pred, ground_truth_mask, shadow_r
         reconstructed_feat = vgg(shadow_remove_img)
     perceptual_loss = F.mse_loss(original_feat, reconstructed_feat)
 
-    total_loss = (lambda_1 * bce_loss) + (lambda_2 * l1_loss) + (lambda_3 * perceptual_loss)
+    adapter_loss = (lambda_1 * bce_loss)
+    diff_loss = (lambda_2 * l1_loss) + (lambda_3 * perceptual_loss)
 
-    return total_loss
+    return adapter_loss, diff_loss
 
 
 if __name__ == "__main__":
@@ -165,12 +166,19 @@ if __name__ == "__main__":
     adapter_shadow = adapter_shadow.to(device)
     shadow_diff = shadow_diff.to(device)
 
-    optimiser = Adam(list (adapter_shadow.parameters()) + list (shadow_diff.parameters()), lr=float(configs["model_config"]["lr"]))
-    scheduler = ReduceLROnPlateau(optimiser, mode='min', patience=3, factor=0.5)
+    # optimiser = Adam(list (adapter_shadow.parameters()) + list (shadow_diff.parameters()), lr=float(configs["model_config"]["lr"]))
+    # scheduler = ReduceLROnPlateau(optimiser, mode='min', patience=3, factor=0.5)
+
+    adapter_optimiser = Adam(adapter_shadow.parameters(), lr=float(configs["model_config"]["lr"]))
+    diff_optimiser = Adam(shadow_diff.parameters(), lr=float(configs["model_config"]["lr"]))
+
+    adapter_scheduler = ReduceLROnPlateau(adapter_optimiser, mode='min', patience=3, factor=0.5)
+    diff_scheduler = ReduceLROnPlateau(diff_optimiser, mode='min', patience=3, factor=0.5)
 
     # Run training loop
     num_epochs = configs["model_config"]["epochs"]
-    best_loss = float("inf")
+    adapter_best_loss = float("inf")
+    diff_best_loss = float("inf")
 
     # TensorBoard monitoring
     writer = SummaryWriter(log_dir=log_path)
@@ -187,27 +195,54 @@ if __name__ == "__main__":
             no_shadow_imgs = shadow_diff(pred_shadow_masks, imgs)
 
             # Compute the loss
-            loss = combined_loss_fn(imgs, pred_shadow_masks, masks, no_shadow_imgs)
+            adapter_loss, diff_loss = combined_loss_fn(imgs, pred_shadow_masks, masks, no_shadow_imgs)
 
             # Backprop
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
+            # optimiser.zero_grad()
+            # loss.backward()
+            # optimiser.step()
+            # scheduler.step(loss)
+
+            adapter_optimiser.zero_grad()
+            adapter_loss.backward()
+            adapter_optimiser.step()
+            adapter_scheduler.step(adapter_loss)
+
+            diff_optimiser.zero_grad()
+            diff_loss.backward()
+            diff_optimiser.step()
+            diff_scheduler.step(diff_loss)
 
             # Log to TensorBoard
-            writer.add_scalar('Loss/train', loss.item(), epoch * len(train_dataloader) + batch_index)
+            writer.add_scalar('AdapterShadow Loss/train', adapter_loss.item(), epoch * len(train_dataloader) + batch_index)
+            writer.add_scalar('ShadowDiffusion Loss/train', diff_loss.item(), epoch * len(train_dataloader) + batch_index)
 
-            # Save models every 5 epochs
-            if (epoch + 1) % 5 == 0:
-                torch.save(adapter_shadow.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_adapt_shadow.pth"))
-                torch.save(shadow_diff.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_shadow_diff.pth"))
+        with torch.no_grad():
+            for batch_index, (imgs, masks) in enumerate(valid_dataloader):
+                imgs = imgs.to(device)
+                masks = masks.to(device)
 
-            # Save best models
-            if loss < best_loss:
-                best_loss = loss
-                torch.save(adapter_shadow.state_dict(),
-                           os.path.join(weights_path, f"best_checkpoint_adapt_shadow.pth"))
-                torch.save(shadow_diff.state_dict(),
-                           os.path.join(weights_path, f"best_checkpoint_shadow_diff.pth"))
+                pred_shadow_masks = adapter_shadow(imgs)
+                no_shadow_imgs = shadow_diff(pred_shadow_masks, imgs)
+                adapter_val_loss, diff_val_loss = combined_loss_fn(imgs, pred_shadow_masks, masks, no_shadow_imgs)
+                writer.add_scalar('AdapterShadow Loss/valid', adapter_val_loss.item(), epoch * len(train_dataloader) + batch_index)
+                writer.add_scalar('ShadowDiffusion Loss/valid', diff_val_loss.item(), epoch * len(train_dataloader) + batch_index)
+                print(f"Epoch {epoch}, Batch {batch_index}: Adapter Validation Loss: {adapter_val_loss.item()}, ShadowDiff Validation Loss: {diff_val_loss.item()}")
+
+        # Save models every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            torch.save(adapter_shadow.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_adapt_shadow.pth"))
+            torch.save(shadow_diff.state_dict(), os.path.join(weights_path, f"checkpoint_{epoch + 1}_shadow_diff.pth"))
+
+        # Save best models
+        if adapter_val_loss < adapter_best_loss:
+            adapter_best_loss = adapter_val_loss
+            torch.save(adapter_shadow.state_dict(),
+                       os.path.join(weights_path, f"best_checkpoint_adapt_shadow.pth"))
+
+        if diff_val_loss < diff_best_loss:
+            diff_best_loss = diff_val_loss
+            torch.save(shadow_diff.state_dict(),
+                       os.path.join(weights_path, f"best_checkpoint_shadow_diff.pth"))
 
     writer.close()
